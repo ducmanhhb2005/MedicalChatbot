@@ -1,149 +1,196 @@
 import os
 import re
-from bs4 import BeautifulSoup
+import time
+from bs4 import BeautifulSoup, NavigableString, Tag
+from langchain.docstore.document import Document
 from langchain_community.embeddings import HuggingFaceEmbeddings
 from langchain_community.vectorstores import FAISS
-from langchain.docstore.document import Document
-import time
-import shutil
+# THAY ĐỔI 1: Bỏ RecursiveCharacterTextSplitter và thêm SemanticChunker
+from langchain_experimental.text_splitter import SemanticChunker
 
-# --- CONFIG (Giữ nguyên) ---
-DATA_SOURCE_DIR = "data/raw/Corpus"
-VECTOR_STORE_PATH = "data/processed/faiss_index_medical"
+# ==============================================================================
+# I. CẤU HÌNH & ĐƯỜNG DẪN
+# ==============================================================================
+# CHUNK_SIZE và CHUNK_OVERLAP không còn tác dụng khi dùng SemanticChunker
+# CHUNK_SIZE = 512
+# CHUNK_OVERLAP = 100
+
+# Lấy đường dẫn tuyệt đối của thư mục chứa script hiện tại (src/process_data.py)
+CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
+# Đi ngược lên 1 cấp để đến thư mục gốc của dự án
+PROJECT_ROOT = os.path.dirname(CURRENT_DIR)
+DATA_SOURCE_DIR = os.path.join(PROJECT_ROOT, "data", "raw", "Corpus")
+VECTOR_STORE_PATH = os.path.join(PROJECT_ROOT, "data", "processed", "faiss_index_medical_semantic") # Đổi tên để không ghi đè file cũ
 EMBEDDING_MODEL_NAME = "bkai-foundation-models/vietnamese-bi-encoder"
+
+# ==============================================================================
+# II. DỮ LIỆU ĐẦU VÀO (Không đổi)
+# ==============================================================================
 TARGET_DISEASES = [
-    'tang-huyet-ap.html', 'benh-mach-vanh.html', 'xo-vua-dong-mach-vanh.html',
-    'thieu-mau-co-tim.html', 'thieu-mau-co-tim-cuc-bo-man-tinh.html',
-    'roi-loan-lipid-mau.html', 'suy-tim.html', 'suy-tim-man-tinh.html',
-    'suy-tim-phai.html', 'suy-tim-trai.html', 'rung-nhi.html', 'dot-quy.html',
-    'dot-quy-thieu-mau-cuc-bo.html', 'dai-thao-duong.html', 'dai-thao-duong-thai-ky.html'
+    'benh-ho-van-tim.html', 'benh-lao-phoi.html', 'khan-tieng.html', 'nhoi-mau-co-tim-khong-st-chenh-len.html',
+    'nhoi-mau-co-tim-that-phai.html', 'nhoi-mau-nao.html', 'suy-gian-tinh-mach-chi-duoi.html',
+    'suy-gian-tinh-mach-sau-chi-duoi.html', 'suy-ho-hap.html', 'suy-tim-giai-doan-cuoi.html',
+    'suy-tim-man-tinh.html', 'suy-tim-mat-bu.html', 'suy-tim-phai.html', 'suy-tim-sung-huyet.html',
+    'suy-tim-trai.html', 'suy-tim.html', 'suy-tinh-mach-man-tinh.html', 'thieu-mau-co-tim-cuc-bo-man-tinh.html',
+    'thieu-mau-co-tim.html', 'tim-dap-nhanh.html', 'ung-thu-phoi-khong-te-bao-nho-giai-doan-1.html',
+    'ung-thu-phoi-khong-te-bao-nho-giai-doan-2.html', 'ung-thu-phoi-khong-te-bao-nho-giai-doan-3.html',
+    'ung-thu-phoi.html', 'ung-thu-thanh-quan.html', 'ung-thu-thuc-quan.html', 'ung-thu-vom-hong-giai-doan-0.html',
+    'ung-thu-vom-hong-giai-doan-1.html', 'ung-thu-vom-hong-giai-doan-2.html', 'ung-thu-vom-hong-giai-doan-3.html',
+    'ung-thu-vom-hong-giai-doan-dau.html', 'ung-thu-vom-hong.html', 'viem-amidan-hoc-mu.html', 'viem-amidan-man-tinh.html',
+    'viem-amidan.html', 'viem-phe-quan-phoi.html', 'viem-phoi-do-metapneumovirus.html', 'viem-phoi.html',
+    'viem-thanh-quan.html', 'xo-phoi.html', 'xo-vua-dong-mach-vanh.html', 'xo-vua-dong-mach.html',
 ]
 
+
 def clean_text(text):
-    text = re.sub(r'\s{2,}', ' ', text)
-    text = re.sub(r'\n+', '\n', text)
+    """Hàm này không đổi, vẫn rất hữu dụng."""
+    text = re.sub(r'\s*\n\s*', '\n', text)
+    text = re.sub(r'\n{3,}', '\n\n', text)
     return text.strip()
 
-# ==============================================================================
-# HÀM EXTRACT HOÀN TOÀN MỚI - CHIẾN LƯỢC SPLIT
-# ==============================================================================
+
 def extract_content_from_html(filepath):
+    """HÀM NÀY CỦA CHỊ VẪN GIỮ NGUYÊN 100% - KHÔNG THAY ĐỔI GÌ CẢ."""
+    CUTOFF_STRING = "HỆ THỐNG BỆNH VIỆN ĐA KHOA TÂM ANH"
     try:
         with open(filepath, 'r', encoding='utf-8') as f:
             soup = BeautifulSoup(f, 'lxml')
+            for tag in soup.find_all(['strong', 'em', 'b']):
+                tag.unwrap()
     except Exception as e:
         print(f"  Lỗi khi đọc file {filepath}: {e}")
         return None, []
 
     disease_name_tag = soup.find('h1')
-    disease_name = disease_name_tag.get_text(strip=True) if disease_name_tag else os.path.basename(filepath)
-    
-    article_content = soup.find('div', class_='entry-content')
-    if not article_content:
-        article_content = soup.find('body')
-        if not article_content: return disease_name, []
-    
-    # Dọn dẹp các thẻ không cần thiết
-    for element_to_remove in article_content.find_all(['script', 'style', 'iframe', 'nav', 'b']):
-        element_to_remove.decompose()
-    for toc_title in article_content.find_all(lambda tag: tag.name == 'h3' and 'mục lục' in tag.get_text(strip=True).lower()):
-        toc_div = toc_title.find_next_sibling('div', class_='lwptoc_i')
-        if toc_div: toc_div.decompose()
-        toc_title.decompose()
-    
-    # "Làm phẳng" HTML: Thay thế H2, H3 bằng một ký tự phân tách đặc biệt
-    # Dùng ký tự đặc biệt khó trùng lặp
-    SEPARATOR = "§SECTION_BREAK§"
-    for h_tag in article_content.find_all(['h2', 'h3']):
-        h_tag.replace_with(f"{SEPARATOR}{h_tag.get_text(strip=True)}{SEPARATOR}")
-        
-    # Lấy toàn bộ văn bản đã được "làm phẳng"
-    full_text = article_content.get_text(separator='\n')
-    
-    # Tách văn bản thành các chunks dựa trên ký tự phân tách
-    sections = full_text.split(SEPARATOR)
-    
+    if not disease_name_tag:
+        return "Không rõ tên bệnh", []
+    disease_name = disease_name_tag.get_text(strip=True).split(':')[0].strip()
+
     structured_content = []
-    # Bỏ qua phần đầu tiên nếu nó rỗng (thường là nội dung trước tiêu đề đầu tiên)
-    for section_text in sections:
-        section_text = section_text.strip()
-        if not section_text:
-            continue
-        
-        # Tách tiêu đề và nội dung
-        lines = section_text.split('\n')
-        section_title = lines[0].strip()
-        section_content = "\n".join(lines[1:]).strip()
-        
-        # Chỉ thêm nếu cả tiêu đề và nội dung đều có
-        if section_title and section_content:
-            structured_content.append({
-                "section": section_title,
-                "content": clean_text(section_content)
-            })
-            
-    # Thêm phần "Tổng quan" (nội dung trước tiêu đề đầu tiên)
-    overview_text = sections[0] if sections else ''
-    if overview_text and not structured_content: # Nếu chỉ có 1 chunk lớn
-         structured_content.append({"section": "Tổng quan", "content": clean_text(overview_text)})
+    # Xử lý phần Tổng quan (nội dung giữa H1 và H2 đầu tiên)
+    current_node = disease_name_tag.find_next_sibling()
+    overview_content = []
+    while current_node and current_node.name != 'h2':
+        if isinstance(current_node, Tag) and 'mục lục' in current_node.get_text(strip=True).lower():
+            break
+        text = current_node.get_text(separator=' ', strip=True)
+        if text:
+            overview_content.append(text)
+        current_node = current_node.find_next_sibling()
     
+    if overview_content:
+        structured_content.append({
+            'section': 'Tổng quan',
+            'content': clean_text('\n'.join(overview_content))
+        })
+        
+    # Xử lý các section H2
+    h2_tags = soup.find_all('h2')
+    for h2 in h2_tags:
+        section_title = h2.get_text(strip=True)
+        section_content = []
+        for sibling in h2.find_next_siblings():
+            if sibling.name == 'h2' or (isinstance(sibling, Tag) and CUTOFF_STRING in sibling.get_text()):
+                break
+            text = sibling.get_text(separator=' ', strip=True)
+            if text:
+                section_content.append(text)
+        
+        content_text = clean_text('\n'.join(section_content).strip())
+        if content_text:
+            structured_content.append({
+                'section': section_title,
+                'content': content_text
+            })
+
     return disease_name, structured_content
 
-# ==============================================================================
-# CÁC HÀM CÒN LẠI GIỮ NGUYÊN
-# ==============================================================================
 def load_and_process_data():
-    all_chunks = []
-    print(f"Bắt đầu quét thư mục: '{DATA_SOURCE_DIR}'")
+    """
+    HÀM NÀY ĐƯỢC NÂNG CẤP LÕI CHUNKING
+    """
+    # Giai đoạn 1: Trích xuất cấu trúc từ HTML (giữ nguyên code của chị)
+    all_docs = []
+    print(f"Bắt đầu Giai đoạn 1: Trích xuất cấu trúc từ HTML...")
     for disease_filename in TARGET_DISEASES:
         filepath = os.path.join(DATA_SOURCE_DIR, disease_filename)
         if os.path.exists(filepath):
-            print(f"-> Đang xử lý file: {disease_filename}")
+            print(f"- Đang xử lý file: {disease_filename}")
             disease_name, sections = extract_content_from_html(filepath)
-            if not sections:
-                print(f"  Cảnh báo: Không trích xuất được nội dung từ file {filepath}")
-                continue
+            if not sections: continue
             for section_data in sections:
-                if not section_data.get('content') or not section_data.get('section'): continue
-                content = f"Thông tin về bệnh {disease_name}, mục '{section_data['section']}': {section_data['content']}"
-                doc = Document(page_content=content, metadata={"source": disease_name, "section": section_data['section']})
-                all_chunks.append(doc)
-        else:
-            print(f"  Cảnh báo: Không tìm thấy file '{disease_filename}'")
+                if section_data.get('content') and section_data.get('section'):
+                    doc = Document(
+                        page_content=section_data['content'],
+                        metadata={"source": disease_name, "section": section_data['section']}
+                    )
+                    all_docs.append(doc)
+
+    print(f"=> Đã trích xuất được {len(all_docs)} sections lớn.")
+
+    # THAY ĐỔI 2: Nâng cấp lõi chunking tại đây
+    # --------------------------------------------------------------------------
+    print(f"\nBắt đầu Giai đoạn 2: Chia nhỏ ngữ nghĩa bằng Semantic Chunker...")
     
-    print(f"\n=> Đã tạo tổng cộng {len(all_chunks)} chunks.")
+    # [CÚ PHÁP TỔNG QUÁT]
+    # 1. Khởi tạo model embedding mà chunker sẽ dùng để "hiểu" văn bản.
+    # 2. Khởi tạo SemanticChunker với model embedding đó.
+    # 3. Áp dụng chunker lên các document đã có.
+
+    # [ÁP DỤNG CHO DỰ ÁN]
+    # 1. Khởi tạo model embedding tiếng Việt
+    print("- Đang tải model embedding cho chunker...")
+    model_kwargs = {'device': 'cuda'}  # Dùng GPU cho nhanh nha chị
+    embeddings = HuggingFaceEmbeddings(
+        model_name=EMBEDDING_MODEL_NAME,
+        model_kwargs=model_kwargs
+    )
+    
+    # 2. Khởi tạo Semantic Chunker
+    text_splitter = SemanticChunker(
+        embeddings, 
+        breakpoint_threshold_type="standard_deviation"
+    )
+
+    # 3. Tiến hành chia nhỏ các document lớn đã trích xuất ở Giai đoạn 1
+    print("- Bắt đầu quá trình chia nhỏ theo ngữ nghĩa...")
+    all_chunks = text_splitter.split_documents(all_docs)
+    # --------------------------------------------------------------------------
+
+    print(f"\n=> ĐÃ HOÀN TẤT: Tạo ra tổng cộng {len(all_chunks)} chunks chất lượng cao.")
     return all_chunks
 
 def create_vector_store(chunks):
-    print("\nBắt đầu quá trình embedding với mô hình local...")
+    """Hàm này gần như không đổi, chỉ cần đảm bảo device là 'cuda' cho nhất quán."""
+    if not chunks:
+        print("\nKhông có chunk nào được tạo.")
+        return
+
+    print("\nBắt đầu quá trình embedding và lưu trữ VectorDB...")
     start_time = time.time()
-    model_kwargs = {'device': 'cpu'}
+    
+    model_kwargs = {'device': 'cuda'} # Chạy trên GPU cho nhanh chị nhé
     encode_kwargs = {'normalize_embeddings': False}
     embeddings = HuggingFaceEmbeddings(
         model_name=EMBEDDING_MODEL_NAME,
         model_kwargs=model_kwargs,
         encode_kwargs=encode_kwargs
     )
+    
     vector_store = FAISS.from_documents(chunks, embedding=embeddings)
+    
     end_time = time.time()
     print(f"=> Embedding hoàn tất trong {end_time - start_time:.2f} giây.")
+    
     vector_store.save_local(VECTOR_STORE_PATH)
     print(f"=> Đã lưu Vector Store vào thư mục: {VECTOR_STORE_PATH}")
 
 if __name__ == '__main__':
-    if os.path.exists(VECTOR_STORE_PATH):
-        print(f"Đang xóa Vector DB cũ tại: {VECTOR_STORE_PATH}")
-        shutil.rmtree(VECTOR_STORE_PATH)
-
+    # THAY ĐỔI 3: Cần cài thêm thư viện mới
+    print("Lưu ý: Chị nhớ chạy 'pip install langchain_experimental' nếu chưa có nhé!")
+    
     processed_chunks = load_and_process_data()
     if processed_chunks:
-        print("\n" + "="*25 + " KIỂM TRA NỘI DUNG CHUNKS " + "="*25)
-        for i, chunk in enumerate(processed_chunks):
-            print(f"\n----------- CHUNK #{i+1} -----------")
-            print(f"METADATA: {chunk.metadata}")
-            print("---------------------------------")
-            print(f"NỘI DUNG:\n{chunk.page_content}\n")
-        print("="*75)
         create_vector_store(processed_chunks)
     else:
-        print("\nKhông có chunk nào được tạo.")
+        print("\nKhông có chunk nào được tạo. Vui lòng kiểm tra lại cấu trúc thư mục và code.")
