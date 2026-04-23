@@ -2,6 +2,8 @@
 
 An intelligent medical chatbot system running entirely locally on your personal computer, using Retrieval-Augmented Generation (RAG) technology to answer questions about cardiovascular diseases with high accuracy.
 
+Link demo: https://youtu.be/pw3MoaDh6gA?si=MEVO6N2AQXqod3O4
+
 ## ✨ Key Features
 
 - **🔐 Completely Local**: No internet required, medical data processed on your machine
